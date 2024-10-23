@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Handler
 import android.os.IBinder
+import android.os.IBinder.DeathRecipient
 import android.os.Process
 import androidx.annotation.Keep
 import androidx.core.content.ContextCompat
@@ -17,11 +18,10 @@ import androidx.core.os.HandlerCompat
 import androidx.core.os.bundleOf
 import androidx.startup.AppInitializer
 import androidx.startup.Initializer
-import kotlinx.coroutines.android.asCoroutineDispatcher
 import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
@@ -31,7 +31,7 @@ class ServiceManager private constructor(context: Context) {
     companion object {
         private const val PATH = "application-binder-services.json"
         private const val KEY_NAME = "name"
-        private const val KEY_RESULT = "result"
+        private const val KEY_BINDER = "binder"
         private const val KEY_CLASS = "class"
         private const val KEY_PROCESS = "process"
 
@@ -53,6 +53,15 @@ class ServiceManager private constructor(context: Context) {
         }
     }
 
+    private inner class DeathCleaner(
+        private val key: String,
+        private val service: IBinder
+    ) : DeathRecipient {
+        override fun binderDied() {
+            proxies.remove(key, service)
+        }
+    }
+
     init {
         AppGlobals.application = context.applicationContext as Application
     }
@@ -65,11 +74,10 @@ class ServiceManager private constructor(context: Context) {
             }.invoke(null) as Handler
         HandlerCompat.createAsync(queuedWork.looper)
     }
-
     private val queryAction = AppGlobals.application.packageName + ".QUERY_BINDER_SERVICE"
-
+    private val syncAction = AppGlobals.application.packageName + ".SYNC_BINDER_SERVICE"
     private val services by run {
-        val block = {
+        val loadServices = {
             val application = AppGlobals.application
             val shortProcessName = AppGlobals.processName.removePrefix(application.packageName)
             val services = JSONObject(
@@ -85,38 +93,80 @@ class ServiceManager private constructor(context: Context) {
                 if (shortProcessName == process) {
                     val clazz = Class.forName(config.getString(KEY_CLASS))
                     val constructor = clazz.getConstructor()
-                    name to lazy { constructor.newInstance() as IBinder }
+                    name to lazy {
+                        val binder = constructor.newInstance() as IBinder
+                        val am = application.getSystemService<ActivityManager>()
+                        if (am != null) {
+                            application.sendBroadcast(
+                                Intent(syncAction).apply {
+                                    putExtras(
+                                        bundleOf(
+                                            KEY_NAME to name,
+                                            KEY_BINDER to binder,
+                                            KEY_PROCESS to AppGlobals.processName
+                                        )
+                                    )
+                                },
+                            )
+                        }
+                        return@lazy binder
+                    }
                 } else {
                     null
                 }
             }.toMap()
         }
         if (AppGlobals.isDebuggable) {
-            lazyOf(block())
+            lazyOf(loadServices())
         } else {
-            lazy(block)
+            lazy(loadServices)
         }
     }
-
     private val proxies = ConcurrentHashMap<String, IBinder>()
 
     init {
-        ContextCompat.registerReceiver(
-            AppGlobals.application,
-            object : BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    val name = intent.getStringExtra(KEY_NAME)
-                    setResultExtras(bundleOf(KEY_RESULT to services[name]?.value))
-                    abortBroadcast()
+        val application = AppGlobals.application
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    queryAction -> {
+                        val name = intent.getStringExtra(KEY_NAME)
+                        setResultExtras(bundleOf(KEY_BINDER to services[name]?.value))
+                        abortBroadcast()
+                    }
+
+                    syncAction -> {
+                        val extras = intent.extras
+                        val process = extras?.getString(KEY_PROCESS)
+                        if (AppGlobals.processName != process) {
+                            val service = extras?.getBinder(KEY_BINDER)
+                            val name = extras?.getString(KEY_NAME)
+                            if (name != null && service != null) {
+                                if (proxies.put(name, service) != service) {
+                                    service.linkToDeath(DeathCleaner(name, service), 0)
+                                }
+                            }
+                        }
+                    }
                 }
-            },
-            IntentFilter(queryAction).apply {
+            }
+        }
+        arrayOf(
+            IntentFilter().apply {
+                addAction(queryAction)
                 addCategory(AppGlobals.processName)
             },
-            null,
-            scheduler,
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
+            IntentFilter(syncAction)
+        ).forEach {
+            ContextCompat.registerReceiver(
+                application,
+                receiver,
+                it,
+                null,
+                scheduler,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        }
     }
 
     private suspend fun getServiceFromProcess(processName: String, name: String): IBinder? {
@@ -133,7 +183,7 @@ class ServiceManager private constructor(context: Context) {
                     override fun onReceive(context: Context, intent: Intent) {
                         con.runCatching {
                             resume(
-                                getResultExtras(false)?.getBinder(KEY_RESULT)
+                                getResultExtras(false)?.getBinder(KEY_BINDER)
                             )
                         }
                     }
@@ -149,7 +199,7 @@ class ServiceManager private constructor(context: Context) {
     private suspend fun getServiceFromOtherProcesses(name: String): IBinder? {
         val application = AppGlobals.application
         val am = application.getSystemService<ActivityManager>() ?: return null
-        return withContext(scheduler.asCoroutineDispatcher()) {
+        return coroutineScope {
             val uid = Process.myUid()
             val pid = Process.myPid()
             val jobs = am.runningAppProcesses.asSequence().filter {
@@ -169,12 +219,12 @@ class ServiceManager private constructor(context: Context) {
                     jobs.remove(job)
                 } else {
                     if (proxies.put(name, service) != service) {
-                        service.linkToDeath({ proxies.remove(name, service) }, 0)
+                        service.linkToDeath(DeathCleaner(name, service), 0)
                     }
-                    return@withContext service
+                    return@coroutineScope service
                 }
             }
-            return@withContext null
+            return@coroutineScope null
         }
     }
 
