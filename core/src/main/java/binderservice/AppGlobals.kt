@@ -4,6 +4,10 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.content.pm.ApplicationInfo
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.os.Process
 import android.util.Log
 
 @SuppressLint("PrivateApi")
@@ -21,7 +25,23 @@ object AppGlobals {
                 isAccessible = true
             }.invoke(null) as Application
         } catch (e: Exception) {
-            Log.e(TAG, "init", e)
+            Log.w(TAG, "application", e)
+        }
+    }
+
+    internal val workLooper: Looper by lazy {
+        try {
+            val queuedWork = Class.forName("android.app.QueuedWork")
+                .getDeclaredMethod("getHandler")
+                .apply {
+                    isAccessible = true
+                }.invoke(null) as Handler
+            queuedWork.looper
+        } catch (e: Exception) {
+            Log.w(TAG, "workLooper", e)
+            HandlerThread("workLooper", Process.THREAD_PRIORITY_FOREGROUND).apply {
+                start()
+            }.looper
         }
     }
 
@@ -29,11 +49,17 @@ object AppGlobals {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             Application.getProcessName()
         } else {
-            val activityThreadClazz = Class.forName("android.app.ActivityThread")
-            activityThreadClazz.getDeclaredMethod("currentProcessName")
-                .apply {
-                    isAccessible = true
-                }.invoke(null) as String
+            try {
+                val activityThreadClazz = Class.forName("android.app.ActivityThread")
+                activityThreadClazz.getDeclaredMethod("currentProcessName")
+                    .apply {
+                        isAccessible = true
+                    }.invoke(null) as String
+            } catch (e: Exception) {
+                // If fallback logic is ever needed, refer to:
+                // https://chromium-review.googlesource.com/c/chromium/src/+/905563/1
+                throw RuntimeException(e)
+            }
         }
     }
 

@@ -1,13 +1,11 @@
 package binderservice
 
-import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.os.Handler
 import android.os.IBinder
 import android.os.IBinder.DeathRecipient
 import android.os.Process
@@ -26,15 +24,13 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 
-@SuppressLint("DiscouragedPrivateApi", "PrivateApi")
-class ServiceManager private constructor(context: Context) {
+class ServiceManager private constructor(private val application: Application) {
     companion object {
         private const val PATH = "application-binder-services.json"
         private const val KEY_NAME = "name"
         private const val KEY_BINDER = "binder"
         private const val KEY_CLASS = "class"
         private const val KEY_PROCESS = "process"
-
         suspend fun getService(name: String): IBinder? {
             return AppInitializer.getInstance(AppGlobals.application)
                 .initializeComponent(Loader::class.java)
@@ -45,7 +41,8 @@ class ServiceManager private constructor(context: Context) {
     @Keep
     internal class Loader : Initializer<ServiceManager> {
         override fun create(context: Context): ServiceManager {
-            return ServiceManager(context)
+            AppGlobals.application = context.applicationContext as Application
+            return ServiceManager(AppGlobals.application)
         }
 
         override fun dependencies(): List<Class<out Initializer<*>>> {
@@ -62,23 +59,11 @@ class ServiceManager private constructor(context: Context) {
         }
     }
 
-    init {
-        AppGlobals.application = context.applicationContext as Application
-    }
-
-    private val scheduler = run {
-        val queuedWork = Class.forName("android.app.QueuedWork")
-            .getDeclaredMethod("getHandler")
-            .apply {
-                isAccessible = true
-            }.invoke(null) as Handler
-        HandlerCompat.createAsync(queuedWork.looper)
-    }
-    private val queryAction = AppGlobals.application.packageName + ".QUERY_BINDER_SERVICE"
-    private val syncAction = AppGlobals.application.packageName + ".SYNC_BINDER_SERVICE"
+    private val scheduler = HandlerCompat.createAsync(AppGlobals.workLooper)
+    private val queryAction = application.packageName + ".QUERY_BINDER_SERVICE"
+    private val syncAction = application.packageName + ".SYNC_BINDER_SERVICE"
     private val services by run {
         val loadServices = {
-            val application = AppGlobals.application
             val shortProcessName = AppGlobals.processName.removePrefix(application.packageName)
             val services = JSONObject(
                 application.assets.open(PATH).use { it.bufferedReader().readText() }
@@ -125,7 +110,6 @@ class ServiceManager private constructor(context: Context) {
     private val proxies = ConcurrentHashMap<String, IBinder>()
 
     init {
-        val application = AppGlobals.application
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 when (intent.action) {
@@ -171,7 +155,6 @@ class ServiceManager private constructor(context: Context) {
 
     private suspend fun getServiceFromProcess(processName: String, name: String): IBinder? {
         return suspendCancellableCoroutine { con ->
-            val application = AppGlobals.application
             application.sendOrderedBroadcast(
                 Intent(queryAction).apply {
                     addCategory(processName)
@@ -197,7 +180,6 @@ class ServiceManager private constructor(context: Context) {
     }
 
     private suspend fun getServiceFromOtherProcesses(name: String): IBinder? {
-        val application = AppGlobals.application
         val am = application.getSystemService<ActivityManager>() ?: return null
         return coroutineScope {
             val uid = Process.myUid()
