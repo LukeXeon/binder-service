@@ -47,7 +47,6 @@ class BinderServiceCompiler : AbstractProcessor() {
     private fun format(message: String): String {
         return StringBuilder(DEFAULT_BUFFER_SIZE)
             .appendLine("==${BinderServiceCompiler::class.java.name}==")
-            .appendLine()
             .appendLine(message)
             .toString()
     }
@@ -89,7 +88,7 @@ class BinderServiceCompiler : AbstractProcessor() {
         )
         targetFile.openWriter().use { it.write(text) }
         log(text)
-        log("Wrote to: " + targetFile.toUri());
+        log("Wrote to: " + targetFile.toUri())
     }
 
     private fun getBinaryName(element: TypeElement): String {
