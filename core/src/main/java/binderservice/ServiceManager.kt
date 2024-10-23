@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Bundle
 import android.os.IBinder
 import android.os.IBinder.DeathRecipient
 import android.os.Process
@@ -60,8 +61,10 @@ class ServiceManager private constructor(private val application: Application) {
     }
 
     private val scheduler = HandlerCompat.createAsync(AppGlobals.workLooper)
-    private val queryAction = application.packageName + ".QUERY_BINDER_SERVICE"
-    private val syncAction = application.packageName + ".SYNC_BINDER_SERVICE"
+    private val actionPrefix = "${application.packageName}.${javaClass.`package`?.name}"
+    private val activateServiceAction = "${actionPrefix}.ACTIVATE_SERVICE"
+    private val serviceStartedAction = "${actionPrefix}.SERVICE_STARTED"
+    private val getActivatedServicesAction = "${actionPrefix}.GET_ACTIVATED_SERVICES"
     private val services by run {
         val loadServices = {
             val shortProcessName = AppGlobals.processName.removePrefix(application.packageName)
@@ -80,17 +83,17 @@ class ServiceManager private constructor(private val application: Application) {
                     val constructor = clazz.getConstructor()
                     name to lazy {
                         val binder = constructor.newInstance() as IBinder
-                        val am = application.getSystemService<ActivityManager>()
-                        if (am != null) {
+                        val uid = Process.myUid()
+                        val pid = Process.myPid()
+                        val am = application.getSystemService<ActivityManager>()!!
+                        val extras = bundleOf(name to binder)
+                        am.runningAppProcesses.asSequence().filter { process ->
+                            process.uid == uid && process.pid != pid
+                        }.forEach { process ->
                             application.sendBroadcast(
-                                Intent(syncAction).apply {
-                                    putExtras(
-                                        bundleOf(
-                                            KEY_NAME to name,
-                                            KEY_BINDER to binder,
-                                            KEY_PROCESS to AppGlobals.processName
-                                        )
-                                    )
+                                Intent(serviceStartedAction).apply {
+                                    addCategory(process.processName)
+                                    putExtras(extras)
                                 },
                             )
                         }
@@ -110,38 +113,67 @@ class ServiceManager private constructor(private val application: Application) {
     private val proxies = ConcurrentHashMap<String, IBinder>()
 
     init {
+        val am = application.getSystemService<ActivityManager>()!!
+        val uid = Process.myUid()
+        val pid = Process.myPid()
+        am.runningAppProcesses.asSequence().filter {
+            it.uid == uid && it.pid != pid
+        }.forEach {
+            application.sendOrderedBroadcast(
+                Intent(getActivatedServicesAction).apply {
+                    addCategory(it.processName)
+                },
+                null,
+                object : BroadcastReceiver() {
+                    override fun onReceive(context: Context, intent: Intent) {
+                        syncServices(getResultExtras(false) ?: return)
+                    }
+                },
+                scheduler,
+                0,
+                null,
+                null
+            )
+        }
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 when (intent.action) {
-                    queryAction -> {
+                    activateServiceAction -> {
                         val name = intent.getStringExtra(KEY_NAME)
                         setResultExtras(bundleOf(KEY_BINDER to services[name]?.value))
-                        abortBroadcast()
                     }
 
-                    syncAction -> {
-                        val extras = intent.extras
-                        val process = extras?.getString(KEY_PROCESS)
-                        if (AppGlobals.processName != process) {
-                            val service = extras?.getBinder(KEY_BINDER)
-                            val name = extras?.getString(KEY_NAME)
-                            if (name != null && service != null) {
-                                if (proxies.put(name, service) != service) {
-                                    service.linkToDeath(DeathCleaner(name, service), 0)
+                    getActivatedServicesAction -> {
+                        var binders: Bundle? = null
+                        for ((name, lazy) in services) {
+                            if (lazy.isInitialized()) {
+                                if (binders == null) {
+                                    binders = Bundle(services.size)
                                 }
+                                binders.putBinder(name, lazy.value)
                             }
                         }
+                        setResultExtras(binders)
+                    }
+
+                    serviceStartedAction -> {
+                        syncServices(intent.extras ?: return)
                     }
                 }
+                abortBroadcast()
             }
         }
-        arrayOf(
+        val processName = AppGlobals.processName
+        sequenceOf(
+            activateServiceAction,
+            getActivatedServicesAction,
+            serviceStartedAction,
+        ).map {
             IntentFilter().apply {
-                addAction(queryAction)
-                addCategory(AppGlobals.processName)
-            },
-            IntentFilter(syncAction)
-        ).forEach {
+                addAction(it)
+                addCategory(processName)
+            }
+        }.forEach {
             ContextCompat.registerReceiver(
                 application,
                 receiver,
@@ -153,10 +185,19 @@ class ServiceManager private constructor(private val application: Application) {
         }
     }
 
+    private fun syncServices(services: Bundle) {
+        for (name in services.keySet()) {
+            val service = services.getBinder(name)
+            if (service != null && proxies.put(name, service) != service) {
+                service.linkToDeath(DeathCleaner(name, service), 0)
+            }
+        }
+    }
+
     private suspend fun getServiceFromProcess(processName: String, name: String): IBinder? {
         return suspendCancellableCoroutine { con ->
             application.sendOrderedBroadcast(
-                Intent(queryAction).apply {
+                Intent(activateServiceAction).apply {
                     addCategory(processName)
                     `package` = application.packageName
                     putExtra(KEY_NAME, name)
@@ -180,7 +221,7 @@ class ServiceManager private constructor(private val application: Application) {
     }
 
     private suspend fun getServiceFromOtherProcesses(name: String): IBinder? {
-        val am = application.getSystemService<ActivityManager>() ?: return null
+        val am = application.getSystemService<ActivityManager>()!!
         return coroutineScope {
             val uid = Process.myUid()
             val pid = Process.myPid()
