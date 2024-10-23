@@ -46,8 +46,8 @@ class BinderServiceCompiler : AbstractProcessor() {
 
     private fun format(message: String): String {
         return StringBuilder(DEFAULT_BUFFER_SIZE)
-            .appendLine("======================================")
-            .appendLine(BinderServiceCompiler::class.java.name)
+            .appendLine("==${BinderServiceCompiler::class.java.name}==")
+            .appendLine()
             .appendLine(message)
             .toString()
     }
